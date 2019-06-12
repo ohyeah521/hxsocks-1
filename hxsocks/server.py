@@ -55,16 +55,10 @@ def parse_hostport(host, default_port=80):
 
 
 class KeyManager(object):
-    def __init__(self, server_cert, limit=3, expire=6):
+    def __init__(self, server_cert):
         '''server_cert: path to server_cert'''
         self.SERVER_CERT = ECC(from_file=server_cert)
-        self._limit = limit
-        self._expire = 6 * 3600
         self.USER_PASS = {}
-        self.userpkeys = defaultdict(deque)  # user name: client key
-        self.pkeyuser = {}  # user pubkey: user name
-        self.pkeykey = {}   # user pubkey: shared secret
-        self.pkeytime = {}  # time of client pubkey creation
 
     def add_user(self, user, password):
         self.USER_PASS[user] = password
@@ -72,43 +66,17 @@ class KeyManager(object):
     def remove_user(self, user):
         del self.USER_PASS[user]
 
-    def iter_user(self):
-        return self.USER_PASS.items()
-
-    def key_xchange(self, user, user_pkey, key_len):
+    def key_xchange(self, user_pkey, key_len):
         # create_key
-        if hashlib.md5(user_pkey).digest() in self.pkeyuser:
-            return 0, 0
-        if len(self.userpkeys[user]) > self._limit:
-            self.del_key(self.userpkeys[user][0])
         ecc = ECC(key_len)
         shared_secret = ecc.get_dh_key(user_pkey)
-        user_pkey_md5 = hashlib.md5(user_pkey).digest()
-        self.userpkeys[user].append(user_pkey_md5)
-        self.pkeyuser[user_pkey_md5] = user
-        self.pkeykey[user_pkey_md5] = shared_secret
-        self.pkeytime[user_pkey_md5] = time.time()
-        return ecc.get_pub_key(), self.USER_PASS[user]
+        return ecc.get_pub_key(), shared_secret
 
-    def check_key(self, pubk):
-        if pubk not in self.pkeykey:
-            return 1
-        if time.time() - self.pkeytime[pubk] > self._expire:
-            self.del_key(pubk)
-            return 1
-
-    def del_key(self, pkey):
-        user = self.pkeyuser[pkey]
-        del self.pkeyuser[pkey]
-        del self.pkeytime[pkey]
-        del self.pkeykey[pkey]
-        self.userpkeys[user].remove(pkey)
-
-    def get_user_by_pubkey(self, pubkey):
-        return self.pkeyuser[pubkey]
-
-    def get_skey_by_pubkey(self, pubkey):
-        return self.pkeykey[pubkey]
+    def verify_user(self, usn, psw):
+        if usn not in self.USER_PASS:
+            raise ValueError('no such user (%s)' % usn)
+        if psw != self.USER_PASS[usn]:
+            raise ValueError('wrong password (%s)' % usn)
 
 
 class ForwardContext:
@@ -214,8 +182,6 @@ class HXsocksHandler:
         self.client_reader = client_reader
         self.logger.debug('incoming connection {}'.format(self.client_address))
 
-        KM = self.server.kmgr
-
         try:
             fut = self.client_reader.readexactly(self.encryptor._iv_len)
             iv = await asyncio.wait_for(fut, timeout=10)
@@ -270,7 +236,6 @@ class HXsocksHandler:
                 req_len, = struct.unpack('>H', req_len)
                 data = await self.read(req_len)
                 data = io.BytesIO(data)
-                ts = int(time.time()) // 30
 
                 pklen = data.read(1)[0]
                 client_pkey = data.read(pklen)
@@ -285,38 +250,35 @@ class HXsocksHandler:
                         data = struct.pack('>H', len(data)) + data
                         client_writer.write(self.encryptor.encrypt(data))
 
-                def auth():
-                    for _ts in [ts, ts - 1, ts + 1]:
-                        for user, passwd in KM.iter_user():
-                            h = hmac.new(passwd.encode(), struct.pack('>I', _ts) + client_pkey + user.encode(), hashlib.sha256).digest()
-                            if compare_digest(h, client_auth):
-                                return user
-
-                client = auth()
-                if not client:
-                    self.logger.error('user not found. {}'.format(self.client_address))
+                if not compare_digest(
+                        hmac.new(self.server.PSK.encode(), client_pkey, hashlib.sha256).digest(),
+                        client_auth):
+                    self.logger.error('handshake info mishash. {}'.format(self.client_address))
                     await self.play_dead()
                     return
-                pkey, passwd = KM.key_xchange(client, client_pkey, self.encryptor._key_len)
+                pkey, secret = self.server.kmgr.key_xchange(client_pkey, self.encryptor._key_len)
                 if pkey:
-                    self.logger.info('new key exchange. client: {} {}'.format(client, self.client_address))
-                    h = hmac.new(passwd.encode(), client_pkey + pkey + client.encode(), hashlib.sha256).digest()
-                    scert = KM.SERVER_CERT.get_pub_key()
-                    signature = KM.SERVER_CERT.sign(h, DEFAULT_HASH)
-                    data = bytes((0, len(pkey), len(scert), len(signature))) + pkey + h + scert + signature + os.urandom(rint)
+                    self.logger.info('new key exchange. {}'.format(self.client_address))
+                    auth = hmac.new(self.server.PSK.encode(), client_pkey + pkey, hashlib.sha256).digest()
+                    scert = self.server.kmgr.SERVER_CERT.get_pub_key()
+                    signature = self.server.kmgr.SERVER_CERT.sign(auth, DEFAULT_HASH)
+                    data = bytes((0, len(pkey), len(scert), len(signature))) + pkey + auth + scert + signature + os.urandom(rint)
                     _send(data)
 
                     client_pkey = hashlib.md5(client_pkey).digest()
                     conn = hxs2_connection(client_reader,
                                            client_writer,
-                                           KM.get_skey_by_pubkey(client_pkey),
+                                           secret,
+                                           self.server.kmgr,
                                            self.server.method,
                                            self.server.proxy,
                                            self.logger)
-                    await conn.wait_close()
+                    err = await conn.wait_close()
+                    if err:
+                        await self.play_dead()
                     return
                 else:
-                    self.logger.error('Private_key already registered. client: {} {}'.format(client, self.client_address))
+                    self.logger.error('Private_key already registered. {}'.format(self.client_address))
                     await self.play_dead()
                     return
             else:

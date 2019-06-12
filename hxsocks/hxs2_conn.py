@@ -41,13 +41,16 @@ END_STREAM_FLAG = 1
 class hxs2_connection():
     bufsize = 8192
 
-    def __init__(self, reader, writer, key, method, proxy, logger):
+    def __init__(self, reader, writer, key, user_manager, method, proxy, logger):
         self.__cipher = AEncryptor(key, method, CTX)
         self._client_reader = reader
         self._client_writer = writer
         self._client_writer.transport.set_write_buffer_limits(0, 0)
+        self._user_manager = user_manager
         self._proxy = proxy
         self._logger = logger
+
+        self._user = None
 
         self._init_time = time.time()
         self._last_active = self._init_time
@@ -64,10 +67,11 @@ class hxs2_connection():
     async def wait_close(self):
         self._logger.debug('start recieving frames...')
         timeout_count = 0
+        err_o = None
 
         while True:
             try:
-                if self._gone and len(self._stream_writer) == 0:
+                if self._gone and not self._stream_writer:
                     break
 
                 time_ = time.time()
@@ -80,8 +84,8 @@ class hxs2_connection():
                     frame_len = await asyncio.wait_for(fut, timeout=10)
                     frame_len, = struct.unpack('>H', frame_len)
                     timeout_count = 0
-                except (asyncio.IncompleteReadError, ValueError, InvalidTag) as e:
-                    self._logger.debug('read frame_len error: %r' % e)
+                except (asyncio.IncompleteReadError, ValueError, InvalidTag) as err:
+                    self._logger.debug('read frame_len error: %r' % err)
                     break
                 except asyncio.TimeoutError:
                     timeout_count += 1
@@ -91,8 +95,8 @@ class hxs2_connection():
                         self._logger.debug('read frame_len timed out.')
                         break
                     continue
-                except OSError as e:
-                    self._logger.debug('read frame_len error: %r' % e)
+                except OSError as err:
+                    self._logger.debug('read frame_len error: %r' % err)
                     break
 
                 # read chunk_data
@@ -101,9 +105,9 @@ class hxs2_connection():
                     # chunk size shoule be lower than 16kB
                     frame_data = await asyncio.wait_for(fut, timeout=5)
                     frame_data = self.__cipher.decrypt(frame_data)
-                except (OSError, InvalidTag, asyncio.TimeoutError) as e:
+                except (OSError, InvalidTag, asyncio.TimeoutError) as err:
                     # something went wrong...
-                    self._logger.debug('read frame error: %r' % e)
+                    self._logger.debug('read frame error: %r' % err)
                     break
 
                 # parse chunk_data
@@ -149,6 +153,16 @@ class hxs2_connection():
                         host_len = payload.read(1)[0]
                         host = payload.read(host_len).decode('ascii')
                         port, = struct.unpack('>H', payload.read(2))
+                        if not self._user:
+                            usn_len = payload.read(1)[0]
+                            usn = payload.read(usn_len).decode('utf8')
+                            psw_len = payload.read(1)[0]
+                            psw = payload.read(psw_len).decode('utf8')
+
+                            # verify user_name
+                            self._user_manager.verify_user(usn, psw)
+                            self._user = usn
+
                         # rest of the payload is discarded
                         asyncio.ensure_future(self.create_connection(stream_id, host, port, self._proxy))
 
@@ -187,31 +201,33 @@ class hxs2_connection():
                 else:
                     self._logger.debug('else')
                     break
-            except Exception as e:
+            except Exception as err:
                 self._logger.error('read from connection error: %r' % e)
                 self._logger.error(traceback.format_exc())
+                err_o = err
         # exit loop, close all streams...
         self._logger.info('recv from hxs2 connect ended')
         for stream_id, writer in self._stream_writer.items():
             try:
                 writer.close()
-            except Exception:
+            except (OSError, AttributeError):
                 pass
+        return err_o
 
     async def create_connection(self, stream_id, host, port, proxy):
-        self._logger.info('connecting %s:%s via %s' % (host, port, proxy))
-        t = time.time()
+        self._logger.info('connecting %s:%s via %s, %s' % (host, port, proxy, self._user))
+        time_start = time.time()
         try:
             reader, writer = await open_connection(host, port, self._proxy)
-        except Exception as e:
+        except Exception as err:
             # tell client request failed.
-            self._logger.info('connect %s:%s failed: %r' % (host, port, e))
+            self._logger.info('connect %s:%s failed: %r' % (host, port, err))
             data = b'\x01' * random.randint(64, 256)
             await self.send_frame(3, 0, stream_id, data)
         else:
             # tell client request success, header frame, first byte is \x00
-            t = time.time() - t
-            self._logger.info('connect %s:%s connected, %.3fs' % (host, port, t))
+            time_start = time.time() - time_start
+            self._logger.info('connect %s:%s connected, %.3fs' % (host, port, time_start))
             # client may reset the connection
             # TODO: maybe keep this connection for later?
             if stream_id in self._stream_status and self._stream_status[stream_id] == CLOSED:
@@ -239,10 +255,10 @@ class hxs2_connection():
             ct = self.__cipher.encrypt(data)
             self._client_writer.write(struct.pack('>H', len(ct)) + ct)
             await self._client_writer.drain()
-        except OSError as e:
+        except OSError as err:
             # destroy connection
-            self._logger.error('send_frame error %r' % e)
-            raise e
+            self._logger.error('send_frame error %r' % err)
+            raise err
         finally:
             self._client_writer_lock.release()
 
